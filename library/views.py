@@ -10,8 +10,6 @@ from django.db import transaction
 from datetime import timedelta
 import csv
 from io import TextIOWrapper
-from django.db.models import Sum, Case, When, IntegerField
-from .models import TransactionItem  # <-- add this import
 
 from .models import User, Student, Book, Transaction, VerificationCode
 from .forms import (LoginForm, StudentIDVerificationForm, StudentRegistrationForm,
@@ -163,18 +161,64 @@ def email_verification(request):
 
 
 @login_required
+def student_dashboard(request):
+    if request.user.user_type != 'student':
+        return redirect('dashboard')
+    
+    student = Student.objects.get(user=request.user)
+    borrowed_books = Transaction.objects.filter(
+        student=student,
+        status='borrowed',
+        approval_status='approved'
+    ).prefetch_related('items__book')
+    
+    history = Transaction.objects.filter(
+        student=student,
+        approval_status='approved'
+    ).prefetch_related('items__book').order_by('-borrowed_date')[:10]
+    
+    search_query = request.GET.get('search', '')
+    category = request.GET.get('category', '')
+    
+    books = Book.objects.all()
+    if search_query:
+        books = books.filter(
+            Q(title__icontains=search_query) |
+            Q(author__icontains=search_query) |
+            Q(isbn__icontains=search_query)
+        )
+    if category:
+        books = books.filter(category=category)
+    
+    categories = Book.objects.values_list('category', flat=True).distinct()
+    
+    context = {
+        'student': student,
+        'borrowed_books': borrowed_books,
+        'history': history,
+        'books': books,
+        'categories': categories,
+        'search_query': search_query,
+        'selected_category': category
+    }
+    
+    return render(request, 'library/student_dashboard.html', context)
+
+
+@login_required
 def admin_dashboard(request):
+    if request.user.user_type != 'admin':
+        return redirect('dashboard')
+    
     total_students = Student.objects.count()
     total_books = Book.objects.count()
-
-    # Count all borrowed TransactionItems
-    total_borrowed = TransactionItem.objects.filter(status='borrowed').count()
-
-    total_available = Book.objects.aggregate(total_available_books=Sum('copies_available'))['total_available_books'] or 0
-    pending_registrations = Student.objects.filter(approval_status='pending').count()
-    pending_borrowing = Transaction.objects.filter(approval_status='pending', status='borrowed').count()
-    recent_transactions = Transaction.objects.order_by('-borrowed_date')[:5]
-
+    total_borrowed = Transaction.objects.filter(status='borrowed', approval_status='approved').count()
+    total_available = Book.objects.filter(copies_available__gt=0).count()
+    pending_registrations = Student.objects.filter(user__isnull=False, is_approved=False).count()
+    pending_borrowing = Transaction.objects.filter(approval_status='pending').count()
+    
+    recent_transactions = Transaction.objects.filter(approval_status='approved').select_related('student').prefetch_related('items__book').order_by('-borrowed_date')[:10]
+    
     context = {
         'total_students': total_students,
         'total_books': total_books,
@@ -182,9 +226,9 @@ def admin_dashboard(request):
         'total_available': total_available,
         'pending_registrations': pending_registrations,
         'pending_borrowing': pending_borrowing,
-        'recent_transactions': recent_transactions,
+        'recent_transactions': recent_transactions
     }
-
+    
     return render(request, 'library/admin_dashboard.html', context)
 
 
@@ -462,13 +506,11 @@ def pos_home(request):
 
 
 @login_required
-@login_required
 def pos_borrow_book(request):
     if request.user.user_type != 'pos':
         return redirect('dashboard')
-
+    
     if request.method == 'POST':
-        # Step 1: Enter student ID
         if 'student_id' in request.POST:
             student_id = request.POST.get('student_id')
             try:
@@ -481,39 +523,41 @@ def pos_borrow_book(request):
                 })
             except Student.DoesNotExist:
                 messages.error(request, 'Student ID not found or not approved by admin')
-
-        # Step 2: Add books by ISBN
+        
         elif 'isbn' in request.POST:
             isbn = request.POST.get('isbn')
             student_id = request.session.get('pos_student_id')
-
+            
             if not student_id:
                 return redirect('pos_borrow_book')
-
+            
             try:
                 book = Book.objects.get(isbn=isbn)
                 if not book.is_available():
                     messages.error(request, 'Book is not available')
                 else:
-                    # Add book to session
                     books = request.session.get('pos_books', [])
-                    if book.id not in [b['id'] for b in books]:
-                        books.append({
-                            'id': book.id,
-                            'isbn': book.isbn,
-                            'title': book.title,
-                            'author': book.author
-                        })
-                    request.session['pos_books'] = books
-
-                    student = Student.objects.get(student_id=student_id)
-                    step = 'confirm' if 'confirm' in request.POST else 'add_books'
-
-                    return render(request, 'library/pos_borrow_book.html', {
-                        'student': student,
-                        'books': books,
-                        'step': step
+                    books.append({
+                        'id': book.id,
+                        'isbn': book.isbn,
+                        'title': book.title,
+                        'author': book.author
                     })
+                    request.session['pos_books'] = books
+                    student = Student.objects.get(student_id=student_id)
+                    
+                    if 'add_another' in request.POST:
+                        return render(request, 'library/pos_borrow_book.html', {
+                            'student': student,
+                            'books': books,
+                            'step': 'add_books'
+                        })
+                    else:
+                        return render(request, 'library/pos_borrow_book.html', {
+                            'student': student,
+                            'books': books,
+                            'step': 'confirm'
+                        })
             except Book.DoesNotExist:
                 messages.error(request, 'Book with this ISBN not found')
                 student = Student.objects.get(student_id=student_id)
@@ -521,118 +565,97 @@ def pos_borrow_book(request):
                     'student': student,
                     'step': 'add_books'
                 })
-
-        # Step 3: Confirm borrow
+        
         elif 'confirm_borrow' in request.POST:
             student_id = request.session.get('pos_student_id')
             books_data = request.session.get('pos_books', [])
-
+            
             if not student_id or not books_data:
                 return redirect('pos_borrow_book')
-
+            
             student = Student.objects.get(student_id=student_id)
-
-            # Create transaction
+            
             transaction_code = Transaction.generate_transaction_code()
             due_date = timezone.now() + timedelta(days=7)
+            
             transaction = Transaction.objects.create(
                 transaction_code=transaction_code,
                 student=student,
                 due_date=due_date,
                 created_by=request.user
             )
-
-            # Create TransactionItem for each book
+            
             from .models import TransactionItem
             for book_data in books_data:
                 book = Book.objects.get(id=book_data['id'])
-                TransactionItem.objects.create(
-                    transaction=transaction,
-                    book=book,
-                    status='borrowed'  # Mark each book as borrowed
-                )
-
-            # Clear session
+                
+                if book.is_available():
+                    TransactionItem.objects.create(
+                        transaction=transaction,
+                        book=book
+                    )
+            
             del request.session['pos_student_id']
             del request.session['pos_books']
-
+            
             return render(request, 'library/pos_borrow_success.html', {
                 'student': student,
                 'transaction': transaction
             })
-
-    # Default: ask for student ID
+    
     return render(request, 'library/pos_borrow_book.html', {'step': 'student_id'})
 
 
 @login_required
-@login_required
 def pos_return_book(request):
     if request.user.user_type != 'pos':
         return redirect('dashboard')
-
+    
     if request.method == 'POST':
-        # Step 1: Verify transaction code
         if 'transaction_code' in request.POST:
             transaction_code = request.POST.get('transaction_code')
             transaction = Transaction.objects.filter(
-                transaction_code=transaction_code,
+                transaction_code__startswith=transaction_code,
                 status='borrowed',
                 approval_status='approved'
-            ).prefetch_related('items__book').first()
-
+            ).select_related('student').prefetch_related('items__book').first()
+            
             if transaction:
-                returned_items = transaction.items.filter(status='returned')
-                unreturned_items = transaction.items.exclude(status='returned')
-
-                return render(request, 'library/pos_return_success.html', {
-                    'student': transaction.student,
+                return render(request, 'library/pos_return_book.html', {
                     'transaction': transaction,
-                    'returned_items': returned_items,
-                    'unreturned_items': unreturned_items,
+                    'step': 'confirm'
                 })
             else:
                 messages.error(request, 'No active borrowing found with this transaction code')
-
-        # Step 2: Return selected books only
+        
         elif 'return_books' in request.POST:
             transaction_code = request.POST.get('transaction_code_value')
-            selected_items = request.POST.getlist('books_to_return')
-
-            if transaction_code and selected_items:
+            
+            if transaction_code:
                 transaction = Transaction.objects.filter(
                     transaction_code=transaction_code,
                     status='borrowed',
                     approval_status='approved'
-                ).prefetch_related('items__book').first()
-
+                ).first()
+                
                 if transaction:
-                    items_to_return = transaction.items.filter(id__in=selected_items)
-                    for item in items_to_return:
-                        if item.status != 'returned':
-                            item.status = 'returned'
-                            item.return_date = timezone.now()
-                            item.save()
-
-                            item.book.copies_available += 1
-                            item.book.save()
-
-                    # If all books returned, mark transaction as returned
-                    if transaction.items.filter(status='borrowed').count() == 0:
-                        transaction.status = 'returned'
-                        transaction.return_date = timezone.now()
-                        transaction.save()
-
-                    returned_items = transaction.items.filter(status='returned')
-                    unreturned_items = transaction.items.exclude(status='returned')
-
+                    for item in transaction.items.all():
+                        item.status = 'returned'
+                        item.return_date = timezone.now()
+                        item.save()
+                        
+                        item.book.copies_available += 1
+                        item.book.save()
+                    
+                    transaction.status = 'returned'
+                    transaction.return_date = timezone.now()
+                    transaction.save()
+                    
                     return render(request, 'library/pos_return_success.html', {
                         'student': transaction.student,
-                        'transaction': transaction,
-                        'returned_items': returned_items,
-                        'unreturned_items': unreturned_items,
+                        'transaction': transaction
                     })
-
+    
     return render(request, 'library/pos_return_book.html', {'step': 'transaction_code'})
 
 
@@ -823,4 +846,3 @@ def delete_student(request, student_id):
         return redirect('manage_students')
     
     return render(request, 'library/delete_student.html', {'student': student})
-
